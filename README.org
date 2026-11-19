@@ -1,0 +1,216 @@
+#+title: emacs-code-insight-mcp
+
+/For those who live in Emacs and code with agents./
+
+Your agent can't see what Emacs sees.  Now it can.
+
+Lend what Emacs knows about your code to any coding agent: Claude Code,
+Codex, Gemini CLI or anything else that speaks MCP.
+
+Emacs already runs a language server for your project, with your settings,
+indexes warm.  This package keeps an MCP server running inside Emacs so
+that agents can ask it about code (types, definitions, references, callers,
+compile errors) instead of grepping, and get answers like
+
+#+begin_example
+/home/me/src/app/src/main/java/com/example/Widget.java:42:17
+```java
+int com.example.Widget.resize(int width, int height)
+```
+
+Resizes the widget, keeping its aspect ratio.
+#+end_example
+
+Agents only ask; nothing moves on your screen.
+
+* How it works
+
+[[https://github.com/manzaltu/claude-code-ide.el][claude-code-ide]] has an MCP server with tools that query Emacs, but it runs
+only for the Claude sessions claude-code-ide itself starts, on a random
+port.  =code-insight-mcp-mode= starts that server on a fixed port with a
+session that never ends, so agents started anywhere (a terminal,
+agent-shell, an IDE) can reach it at
+
+#+begin_example
+http://localhost:7777/mcp/emacs
+#+end_example
+
+On top of claude-code-ide's tools it adds its own, which ask the language
+server through [[https://github.com/emacs-lsp/lsp-mode][lsp-mode]].
+
+#+begin_example
+agent --MCP--> Emacs (this package, lsp-mode) --> language server (jdtls, pyright, ...)
+#+end_example
+
+Going through Emacs means the agent uses the same language server you do:
+no second copy of a heavy server such as jdtls, and your configuration
+(JDK, build tool, virtualenv) applies as it is.
+
+* Tools
+
+| Tool                   | What it answers                                                    |
+|------------------------+--------------------------------------------------------------------|
+| =lsp_hover=            | Type or signature of a symbol, and its documentation               |
+| =lsp_definition=       | Where a symbol is defined, inside libraries too                    |
+| =lsp_references=       | Where a symbol is used                                             |
+| =lsp_implementation=   | What implements an interface or abstract method                    |
+| =lsp_call_hierarchy=   | Callers of a function, or what it calls (one level)                |
+| =lsp_workspace_symbol= | Symbols of the project, and its libraries, by name                 |
+| =lsp_diagnostics=      | Errors and warnings of a file, waiting for the server's new check |
+| =imenu_symbols=        | Symbols defined in a file                                          |
+| =xref_references=      | Where an identifier is used, through Emacs's xref                  |
+| =xref_apropos=         | Symbols matching a pattern, through Emacs's xref                   |
+| =treesit_info=         | Tree-sitter syntax tree around a position                          |
+
+The =lsp_*= tools are this package's.  The last four are claude-code-ide's,
+served under shorter names; its project info tool is left out.
+
+The =lsp_*= tools that look at a position take a file, a line, and
+preferably the symbol's name on that line rather than a column, since
+agents easily miscount columns.  Results are one location per line,
+=FILE:LINE:COLUMN: text=.  Locations inside libraries are given as files
+the agent can read where the language server provides them; with jdtls
+(lsp-java) that includes classes in jars, as source or decompiled.
+
+=lsp_diagnostics= is meant for after an agent edits a file: when the file
+changed since the server last checked it, it waits for the new check, so
+the agent learns about compile errors without building.
+
+* Requirements
+
+- Emacs 29.1 or later
+- [[https://github.com/manzaltu/claude-code-ide.el][claude-code-ide]] 0.3.0 or later, for its MCP server and tools.  It is not
+  on MELPA, see Install.
+- [[https://github.com/emacs-lsp/lsp-mode][lsp-mode]], for the =lsp_*= tools, with a language server for each
+  language you want them for.  Without it the other tools still work.
+- Emacs built with tree-sitter and the language's grammar, for
+  =treesit_info=
+
+* Install
+
+Not on MELPA.  Neither is claude-code-ide, so install it first; package.el
+cannot fetch it as a dependency.
+
+With =use-package= and =:vc= (Emacs 30):
+
+#+begin_src emacs-lisp
+(use-package claude-code-ide
+  :vc (:url "https://github.com/manzaltu/claude-code-ide.el" :rev :newest))
+
+(use-package code-insight-mcp
+  :vc (:url "https://github.com/analytical-engines/emacs-code-insight-mcp"
+       :rev :newest)
+  :hook (after-init . code-insight-mcp-mode))
+#+end_src
+
+With =package-vc-install= (Emacs 29):
+
+#+begin_src emacs-lisp
+(package-vc-install "https://github.com/manzaltu/claude-code-ide.el")
+(package-vc-install "https://github.com/analytical-engines/emacs-code-insight-mcp")
+#+end_src
+
+Or put =code-insight-mcp.el= somewhere on your =load-path=.
+
+* Setup
+
+** Emacs
+
+#+begin_src emacs-lisp
+(require 'code-insight-mcp)
+(code-insight-mcp-mode 1)
+#+end_src
+
+The echo area says =code-insight-mcp: serving at
+http://localhost:7777/mcp/emacs=.  claude-code-ide's own Claude sessions
+are not needed.
+
+** Agents
+
+Register the URL once with each agent.  For Claude Code, for all your
+projects:
+
+#+begin_src sh
+claude mcp add -s user -t http emacs-code-insight http://localhost:7777/mcp/emacs
+#+end_src
+
+Other agents that support MCP over HTTP take the same URL in their own
+configuration.
+
+** Languages
+
+The =lsp_*= tools work for a file when lsp-mode works for it in your
+Emacs: a major mode for the language, and its language server installed.
+If it is comfortable to write that language in your Emacs, the tools work
+for it.
+
+Tools start LSP for a file only in a project lsp-mode already knows, so
+that they never stop at lsp-mode's "Import project root?" question.  Open
+a file of a new project in Emacs once and answer it.  A server that is
+still starting is waited for.
+
+** Getting agents to use the tools
+
+Agents are used to their own search and read tools and may not reach for
+these unless told.  A line in the agent's instructions helps, for example
+in =~/.claude/CLAUDE.md=:
+
+#+begin_example
+For definitions, references, types and compile errors in code, try the
+emacs-code-insight lsp_* tools before grep.
+#+end_example
+
+* Customization
+
+=M-x customize-group RET code-insight-mcp=
+
+| Variable                              | Default | Meaning                                             |
+|---------------------------------------+---------+-----------------------------------------------------|
+| =code-insight-mcp-port=               |    7777 | Port of the MCP server                              |
+| =code-insight-mcp-session-id=         | "emacs" | Last part of the URL                                |
+| =code-insight-mcp-session-directory=  |     "~" | Where relative file names are taken from            |
+| =code-insight-mcp-max-locations=      |     200 | Most results a tool lists; the rest are counted     |
+| =code-insight-mcp-lsp-start-timeout=  |      60 | Seconds to wait for a language server to be ready   |
+| =code-insight-mcp-diagnostics-timeout= |      10 | Seconds to wait for a changed file to be checked    |
+
+* While a tool runs
+
+- Nothing asks for an answer in the minibuffer.  File local variables
+  (settings written in the file itself, in a block at its end or on its
+  =-*-= line) that Emacs would ask about before applying are skipped
+  instead, and LSP is not started for unknown projects.
+- Buffers whose files changed on disk, and that you have not modified, are
+  reverted first, so answers are about the files as the agent left them.
+  Buffers you have modified are left alone, and agents see their unsaved
+  contents.
+- Emacs is busy while a language server answers, as when you ask it
+  yourself.
+
+* Limitations
+
+- Files the tools look at are opened in Emacs and stay open, as when you
+  visit them, but without the local variables that were skipped (see
+  above); =M-x revert-buffer= applies them as usual.
+- The project info tool is removed from, and the other tools renamed in,
+  claude-code-ide's tool list, so Claude sessions started from
+  claude-code-ide see the same.
+- Any program on the machine can reach the port.  The tools only read.
+- Some of lsp-mode's internals are used (to know when diagnostics arrive
+  and when a server is ready), so a change in lsp-mode may need a change
+  here.
+- Only lsp-mode is supported, not Eglot.
+- =xref_references= and =xref_apropos= use whatever xref backend the
+  buffer has: lsp-mode's when it is on, Emacs Lisp's in Emacs Lisp.  In
+  other buffers xref falls back to a TAGS file (made by etags or ctags),
+  and may ask in the minibuffer which one to visit, which would make the
+  tool wait for an answer.  This is not prevented yet.
+
+* Acknowledgements
+
+- [[https://github.com/manzaltu][Yoav Orot]] for claude-code-ide, whose MCP server and tools this package
+  serves.
+- The [[https://github.com/emacs-lsp][emacs-lsp]] maintainers for lsp-mode and lsp-java.
+
+* License
+
+GPL-3.0-or-later.  See [[file:LICENSE][LICENSE]].
