@@ -36,6 +36,13 @@
 ;; a random port; this package starts it on a fixed port and registers
 ;; one session that never ends, so agents started anywhere can use it.
 ;;
+;; On top of those it serves its own tools, named lsp_*, which ask the
+;; language server for hovers, definitions, references,
+;; implementations, call hierarchies, workspace symbols and
+;; diagnostics, through lsp-mode or Eglot, whichever manages the file.
+;; Neither is required; without them those tools say there is no
+;; language server.
+;;
 ;; Setup:
 ;;
 ;;   (require 'code-insight-mcp)
@@ -190,6 +197,12 @@ applied in files FN opens or reverts."
 
 ;;;; LSP tools
 
+;; The tools ask the language server through lsp-mode or Eglot,
+;; whichever manages the file's buffer.  lsp-mode gives the server's
+;; JSON objects as hash tables (or plists with `lsp-use-plists'), Eglot
+;; as plists, and arrays as vectors or lists, so they are read with
+;; `code-insight-mcp--get' rather than either client's accessors.
+
 (declare-function lsp "lsp-mode")
 (declare-function lsp-request "lsp-mode")
 (declare-function lsp-session "lsp-mode")
@@ -198,46 +211,40 @@ applied in files FN opens or reverts."
 (declare-function lsp--workspace-status "lsp-mode")
 (declare-function lsp-find-session-folder "lsp-mode")
 (declare-function lsp--text-document-position-params "lsp-mode")
-(declare-function lsp:hover-contents "lsp-protocol")
-(declare-function lsp-markup-content? "lsp-protocol")
-(declare-function lsp:markup-content-value "lsp-protocol")
-(declare-function lsp-marked-string? "lsp-protocol")
-(declare-function lsp:marked-string-value "lsp-protocol")
-(declare-function lsp:marked-string-language "lsp-protocol")
-(declare-function lsp--uri-to-path "lsp-mode")
 (declare-function lsp--make-reference-params "lsp-mode")
+(declare-function lsp--uri-to-path "lsp-mode")
 (declare-function lsp-diagnostics "lsp-mode")
-(declare-function lsp:symbol-information-location "lsp-protocol")
-(declare-function lsp:call-hierarchy-item-uri "lsp-protocol")
-(declare-function lsp:call-hierarchy-item-selection-range "lsp-protocol")
-(declare-function lsp:call-hierarchy-item-name "lsp-protocol")
-(declare-function lsp:call-hierarchy-item-kind "lsp-protocol")
-(declare-function lsp:call-hierarchy-item-detail? "lsp-protocol")
-(declare-function lsp:call-hierarchy-incoming-call-from "lsp-protocol")
-(declare-function lsp:call-hierarchy-incoming-call-from-ranges "lsp-protocol")
-(declare-function lsp:call-hierarchy-outgoing-call-to "lsp-protocol")
-(declare-function lsp:call-hierarchy-outgoing-call-from-ranges "lsp-protocol")
-(declare-function lsp:symbol-information-container-name? "lsp-protocol")
-(declare-function lsp:symbol-information-kind "lsp-protocol")
-(declare-function lsp:symbol-information-name "lsp-protocol")
-(defvar lsp-symbol-kinds)
 (declare-function lsp--text-document-did-save "lsp-mode")
 (declare-function lsp--fix-path-casing "lsp-mode")
-(declare-function lsp:publish-diagnostics-params-uri "lsp-protocol")
-(declare-function lsp:diagnostic-range "lsp-protocol")
-(declare-function lsp:diagnostic-severity? "lsp-protocol")
-(declare-function lsp:diagnostic-message "lsp-protocol")
-(declare-function lsp:diagnostic-source? "lsp-protocol")
-(declare-function lsp:diagnostic-code? "lsp-protocol")
-(declare-function lsp-location-link? "lsp-protocol")
-(declare-function lsp:location-link-target-uri "lsp-protocol")
-(declare-function lsp:location-link-target-selection-range "lsp-protocol")
-(declare-function lsp:location-uri "lsp-protocol")
-(declare-function lsp:location-range "lsp-protocol")
-(declare-function lsp:range-start "lsp-protocol")
-(declare-function lsp:position-line "lsp-protocol")
-(declare-function lsp:position-character "lsp-protocol")
 (defvar lsp-mode)
+(declare-function eglot-current-server "eglot")
+(declare-function eglot-managed-p "eglot")
+(declare-function eglot-server-capable "eglot")
+(declare-function eglot-uri-to-path "eglot")
+(declare-function eglot--TextDocumentPositionParams "eglot")
+(declare-function eglot--signal-textDocument/didChange "eglot")
+(declare-function eglot--signal-textDocument/didSave "eglot")
+(declare-function jsonrpc-request "jsonrpc")
+
+(defun code-insight-mcp--get (object &rest keys)
+  "Return the value at KEYS in the JSON OBJECT, nil if there is none.
+KEYS are strings, the names of the JSON properties to follow in turn.
+OBJECT may be a hash table with string keys or a plist with keyword
+keys."
+  (dolist (key keys object)
+    (setq object
+          (cond ((hash-table-p object) (gethash key object))
+                ((and (consp object) (keywordp (car object)))
+                 (plist-get object (intern (concat ":" key))))))))
+
+(defun code-insight-mcp--list (array)
+  "Return the JSON ARRAY as a list; nil stays nil.
+An object, which a server may give where an array of one is meant,
+becomes a list of it."
+  (cond ((null array) nil)
+        ((vectorp array) (append array nil))
+        ((and (consp array) (not (keywordp (car array)))) array)
+        (t (list array))))
 
 (defun code-insight-mcp--file-buffer (file-path)
   "Return a buffer visiting FILE-PATH, opening it when needed.
@@ -248,8 +255,24 @@ A relative FILE-PATH is taken from `code-insight-mcp-session-directory'."
     (or (find-buffer-visiting file)
         (find-file-noselect file))))
 
+;;;;; Clients
+
+(defun code-insight-mcp--client ()
+  "Return the LSP client of the current buffer: `lsp-mode', `eglot' or nil."
+  (cond ((and (bound-and-true-p lsp-mode) (lsp-workspaces)) 'lsp-mode)
+        ((and (fboundp 'eglot-managed-p) (eglot-managed-p)) 'eglot)))
+
+(defconst code-insight-mcp--capabilities
+  '(("textDocument/hover" . :hoverProvider)
+    ("textDocument/definition" . :definitionProvider)
+    ("textDocument/references" . :referencesProvider)
+    ("textDocument/implementation" . :implementationProvider)
+    ("textDocument/prepareCallHierarchy" . :callHierarchyProvider)
+    ("workspace/symbol" . :workspaceSymbolProvider))
+  "LSP methods the tools send, and the server capabilities they need.")
+
 (defun code-insight-mcp--lsp-ready-p (method)
-  "Return non-nil if the buffer's language servers are ready for METHOD.
+  "Return non-nil if the buffer's lsp-mode servers are ready for METHOD.
 They are when every one is initialized and, unless METHOD is nil, one
 can handle METHOD.  Servers such as jdtls register what they can
 handle only after they are initialized."
@@ -262,29 +285,71 @@ handle only after they are initialized."
 (defun code-insight-mcp--ensure-lsp (&optional method)
   "Make sure LSP is on and ready for METHOD in the buffer, or signal an error.
 Without METHOD, ready means the language servers are initialized.
-LSP is started only for files in a project LSP already knows, so that
-starting it never asks which project the file belongs to.  A server
-still starting is waited for, at most `code-insight-mcp-lsp-start-timeout'
-seconds."
-  ;; `lsp-mode' stays on in buffers whose server was shut down, so look
-  ;; at the servers, not the mode
-  (unless (and (bound-and-true-p lsp-mode) (lsp-workspaces))
-    (unless (and (require 'lsp-mode nil t)
-                 buffer-file-name
-                 (lsp-find-session-folder (lsp-session) buffer-file-name))
-      (error "No LSP in %s, and its project is not known to LSP"
-             (buffer-name)))
-    (lsp)
-    (unless (bound-and-true-p lsp-mode)
-      (error "Could not start LSP in %s" (buffer-name))))
-  (let ((deadline (+ (float-time) code-insight-mcp-lsp-start-timeout)))
-    (while (and (not (code-insight-mcp--lsp-ready-p method))
-                (< (float-time) deadline))
-      (accept-process-output nil 0.1)))
-  (unless (code-insight-mcp--lsp-ready-p method)
-    (error "The language server for %s was not ready%s in %s seconds; try again later"
-           (buffer-name) (if method (format " for %s" method) "")
-           code-insight-mcp-lsp-start-timeout)))
+A buffer Eglot manages is used as it is.  Otherwise lsp-mode is used,
+and started only for files in a project it already knows, so that
+starting it never asks which project the file belongs to; a server
+still starting is waited for, at most
+`code-insight-mcp-lsp-start-timeout' seconds.  Eglot is not started
+by the tools: a file opened while its project's server runs is
+managed by it already."
+  (pcase (code-insight-mcp--client)
+    ('eglot
+     (let ((capability (alist-get method code-insight-mcp--capabilities
+                                  nil nil #'equal)))
+       (when (and capability (not (eglot-server-capable capability)))
+         (error "The language server for %s cannot handle %s"
+                (buffer-name) method))))
+    (_
+     ;; `lsp-mode' stays on in buffers whose server was shut down, so
+     ;; look at the servers, not the mode
+     (unless (code-insight-mcp--client)
+       (unless (and (require 'lsp-mode nil t)
+                    buffer-file-name
+                    (lsp-find-session-folder (lsp-session) buffer-file-name))
+         (error "No language server for %s; open a file of its project in Emacs and start lsp-mode or Eglot there once"
+                (buffer-name)))
+       (lsp)
+       (unless (bound-and-true-p lsp-mode)
+         (error "Could not start LSP in %s" (buffer-name))))
+     (let ((deadline (+ (float-time) code-insight-mcp-lsp-start-timeout)))
+       (while (and (not (code-insight-mcp--lsp-ready-p method))
+                   (< (float-time) deadline))
+         (accept-process-output nil 0.1)))
+     (unless (code-insight-mcp--lsp-ready-p method)
+       (error "The language server for %s was not ready%s in %s seconds; try again later"
+              (buffer-name) (if method (format " for %s" method) "")
+              code-insight-mcp-lsp-start-timeout)))))
+
+(defun code-insight-mcp--request (method params)
+  "Send request METHOD with PARAMS to the current buffer's language server.
+Return the result."
+  (if (eq (code-insight-mcp--client) 'eglot)
+      (jsonrpc-request (eglot-current-server) (intern (concat ":" method))
+                       params)
+    (lsp-request method params)))
+
+(defun code-insight-mcp--position-params ()
+  "Return TextDocumentPositionParams for point."
+  (if (eq (code-insight-mcp--client) 'eglot)
+      (eglot--TextDocumentPositionParams)
+    (lsp--text-document-position-params)))
+
+(defun code-insight-mcp--reference-params ()
+  "Return ReferenceParams for point, leaving the declaration out."
+  (if (eq (code-insight-mcp--client) 'eglot)
+      (append (eglot--TextDocumentPositionParams)
+              '(:context (:includeDeclaration :json-false)))
+    (lsp--make-reference-params nil t)))
+
+(defun code-insight-mcp--uri-to-path (uri)
+  "Return the file name of URI, as the current buffer's client resolves it.
+With lsp-mode, URIs into libraries (for example jdtls's \"jdt:\" ones)
+become files a client can read."
+  (if (eq (code-insight-mcp--client) 'eglot)
+      (eglot-uri-to-path uri)
+    (lsp--uri-to-path uri)))
+
+;;;;; Positions and locations
 
 (defun code-insight-mcp--goto (line symbol column)
   "Move to LINE, then to SYMBOL on it, or to COLUMN.
@@ -305,73 +370,24 @@ first non-blank character of LINE."
    (t
     (back-to-indentation))))
 
-(defun code-insight-mcp--hover-text (contents)
-  "Return the text of hover CONTENTS, nil when there is none.
-CONTENTS is a MarkupContent, a MarkedString or a vector of MarkedString."
-  (cond
-   ((null contents) nil)
-   ((stringp contents) (and (not (string-empty-p contents)) contents))
-   ((vectorp contents)
-    (let ((parts (delq nil (mapcar #'code-insight-mcp--hover-text contents))))
-      (and parts (string-join parts "\n\n"))))
-   ((lsp-markup-content? contents)
-    (code-insight-mcp--hover-text (lsp:markup-content-value contents)))
-   ((lsp-marked-string? contents)
-    (let ((value (lsp:marked-string-value contents))
-          (language (lsp:marked-string-language contents)))
-      (and value (not (string-empty-p value))
-           (if language
-               (format "```%s\n%s\n```" language value)
-             value))))))
-
 (defun code-insight-mcp--lsp-request-at (method line symbol column
                                                  &optional params)
   "Send LSP request METHOD for a position in the current buffer.
 The position is found by `code-insight-mcp--goto' from LINE, SYMBOL
 and COLUMN.  PARAMS is a function called there to make the request's
-parameters, `lsp--text-document-position-params' by default.  Return
+parameters, `code-insight-mcp--position-params' by default.  Return
 \(POSITION . RESPONSE), POSITION being a \"FILE:LINE:COLUMN\" string."
   (save-excursion
     (code-insight-mcp--goto line symbol column)
     (cons (format "%s:%d:%d" buffer-file-name
                   (line-number-at-pos) (1+ (current-column)))
-          (lsp-request method (funcall (or params
-                                           #'lsp--text-document-position-params))))))
+          (code-insight-mcp--request
+           method (funcall (or params #'code-insight-mcp--position-params))))))
 
-(defun code-insight-mcp--strip-hover-source (text)
-  "Return TEXT without a trailing \"Source: *[NAME](URI)*\" line.
-jdtls ends hovers with such a link to the file the symbol is in, which
-the agent asked about already."
-  (let ((stripped
-         (and text
-              (replace-regexp-in-string
-               "\\(?:\n\\s-*\\)*\n?Source: \\*\\[[^]\n]*\\]([^)\n]*)\\*\\s-*\\'" "" text))))
-    (and stripped (not (string-empty-p stripped)) stripped)))
-
-(defun code-insight-mcp-lsp-hover (file-path line &optional symbol column)
-  "Return what LSP shows on hover at LINE of FILE-PATH.
-The position is SYMBOL on LINE if given, else COLUMN, else the first
-non-blank character.  LINE and COLUMN count from 1."
-  (with-current-buffer (code-insight-mcp--file-buffer file-path)
-    (code-insight-mcp--ensure-lsp "textDocument/hover")
-    (pcase-let ((`(,position . ,hover)
-                 (code-insight-mcp--lsp-request-at
-                  "textDocument/hover" line symbol column)))
-      (format "%s\n%s" position
-              (or (and hover (code-insight-mcp--strip-hover-source
-                              (code-insight-mcp--hover-text
-                               (lsp:hover-contents hover))))
-                  "No hover information")))))
-
-(defun code-insight-mcp--location-list (response)
-  "Return the locations in RESPONSE as a list.
-RESPONSE is nil, a Location or LocationLink, or an array of them.
-lsp-mode gives arrays as vectors or lists, and objects as hash tables
-or, with `lsp-use-plists', as plists."
-  (cond ((null response) nil)
-        ((vectorp response) (append response nil))
-        ((and (consp response) (not (keywordp (car response)))) response)
-        (t (list response))))
+(defun code-insight-mcp--range-start (range)
+  "Return (LINE COLUMN) where RANGE starts, counting from 1."
+  (list (1+ (code-insight-mcp--get range "start" "line"))
+        (1+ (code-insight-mcp--get range "start" "character"))))
 
 (defvar code-insight-mcp--file-lines nil
   "Nil, or a hash table from file names to vectors of their lines.
@@ -398,19 +414,14 @@ Bound while a tool runs, so that each file is read once.")
 
 (defun code-insight-mcp--location-position (location)
   "Return (FILE LINE COLUMN) of LOCATION, LINE and COLUMN counting from 1.
-LOCATION is a Location or LocationLink.  Its URI is resolved in the
-current buffer, so that URIs into libraries (for example jdtls's
-\"jdt:\" ones) become files a client can read."
-  (pcase-let* ((`(,uri ,range)
-                (if (lsp-location-link? location)
-                    (list (lsp:location-link-target-uri location)
-                          (lsp:location-link-target-selection-range location))
-                  (list (lsp:location-uri location)
-                        (lsp:location-range location))))
-               (start (lsp:range-start range)))
-    (list (lsp--uri-to-path uri)
-          (1+ (lsp:position-line start))
-          (1+ (lsp:position-character start)))))
+LOCATION is a Location or LocationLink; its URI is resolved by
+`code-insight-mcp--uri-to-path'."
+  (let* ((link (code-insight-mcp--get location "targetUri"))
+         (uri (or link (code-insight-mcp--get location "uri")))
+         (range (code-insight-mcp--get
+                 location (if link "targetSelectionRange" "range"))))
+    (cons (code-insight-mcp--uri-to-path uri)
+          (code-insight-mcp--range-start range))))
 
 (defun code-insight-mcp--format-location (location)
   "Return LOCATION as \"FILE:LINE:COLUMN: TEXT\".
@@ -421,6 +432,67 @@ LOCATION is as in `code-insight-mcp--location-position'."
             (if (file-readable-p file)
                 (code-insight-mcp--line-text file line)
               ""))))
+
+(defconst code-insight-mcp--symbol-kinds
+  ["File" "Module" "Namespace" "Package" "Class" "Method" "Property" "Field"
+   "Constructor" "Enum" "Interface" "Function" "Variable" "Constant" "String"
+   "Number" "Boolean" "Array" "Object" "Key" "Null" "EnumMember" "Struct"
+   "Event" "Operator" "TypeParameter"]
+  "Names of the LSP SymbolKinds, from 1.")
+
+(defun code-insight-mcp--symbol-kind (kind)
+  "Return the name of the LSP SymbolKind KIND."
+  (if (and (integerp kind) (<= 1 kind (length code-insight-mcp--symbol-kinds)))
+      (aref code-insight-mcp--symbol-kinds (1- kind))
+    "Symbol"))
+
+;;;;; Hover
+
+(defun code-insight-mcp--hover-text (contents)
+  "Return the text of hover CONTENTS, nil when there is none.
+CONTENTS is a MarkupContent, a MarkedString or an array of MarkedString."
+  (cond
+   ((null contents) nil)
+   ((stringp contents) (and (not (string-empty-p contents)) contents))
+   ((or (vectorp contents)
+        (and (consp contents) (not (keywordp (car contents)))))
+    (let ((parts (delq nil (mapcar #'code-insight-mcp--hover-text
+                                   (code-insight-mcp--list contents)))))
+      (and parts (string-join parts "\n\n"))))
+   (t
+    (let ((value (code-insight-mcp--get contents "value"))
+          (language (code-insight-mcp--get contents "language")))
+      (and (stringp value) (not (string-empty-p value))
+           (if language
+               (format "```%s\n%s\n```" language value)
+             value))))))
+
+(defun code-insight-mcp--strip-hover-source (text)
+  "Return TEXT without a trailing \"Source: *[NAME](URI)*\" line.
+jdtls ends hovers with such a link to the file the symbol is in, which
+the agent asked about already."
+  (let ((stripped
+         (and text
+              (replace-regexp-in-string
+               "\\(?:\n\\s-*\\)*\n?Source: \\*\\[[^]\n]*\\]([^)\n]*)\\*\\s-*\\'" "" text))))
+    (and stripped (not (string-empty-p stripped)) stripped)))
+
+(defun code-insight-mcp-lsp-hover (file-path line &optional symbol column)
+  "Return what LSP shows on hover at LINE of FILE-PATH.
+The position is SYMBOL on LINE if given, else COLUMN, else the first
+non-blank character.  LINE and COLUMN count from 1."
+  (with-current-buffer (code-insight-mcp--file-buffer file-path)
+    (code-insight-mcp--ensure-lsp "textDocument/hover")
+    (pcase-let ((`(,position . ,hover)
+                 (code-insight-mcp--lsp-request-at
+                  "textDocument/hover" line symbol column)))
+      (format "%s\n%s" position
+              (or (code-insight-mcp--strip-hover-source
+                   (code-insight-mcp--hover-text
+                    (code-insight-mcp--get hover "contents")))
+                  "No hover information")))))
+
+;;;;; Definitions, references, implementations
 
 (defun code-insight-mcp--lsp-locations (method file-path line symbol column
                                                none &optional params)
@@ -434,7 +506,7 @@ no locations."
     (pcase-let* ((`(,position . ,response)
                   (code-insight-mcp--lsp-request-at
                    method line symbol column params))
-                 (locations (code-insight-mcp--location-list response))
+                 (locations (code-insight-mcp--list response))
                  (shown (seq-take locations code-insight-mcp-max-locations))
                  (code-insight-mcp--file-lines (make-hash-table :test #'equal)))
       (concat position "\n"
@@ -460,7 +532,7 @@ The declaration itself is not included.  The position is found as in
   (code-insight-mcp--lsp-locations "textDocument/references"
                                    file-path line symbol column
                                    "No references found"
-                                   (lambda () (lsp--make-reference-params nil t))))
+                                   #'code-insight-mcp--reference-params))
 
 (defun code-insight-mcp-lsp-implementation (file-path line &optional symbol column)
   "Return what implements the symbol at LINE of FILE-PATH.
@@ -474,20 +546,19 @@ The position is found as in `code-insight-mcp-lsp-hover'."
 (defun code-insight-mcp--item-position (item range)
   "Return (FILE LINE COLUMN) of RANGE in the file of call hierarchy ITEM.
 LINE and COLUMN count from 1.  RANGE defaults to ITEM's selection range."
-  (let ((start (lsp:range-start
-                (or range (lsp:call-hierarchy-item-selection-range item)))))
-    (list (lsp--uri-to-path (lsp:call-hierarchy-item-uri item))
-          (1+ (lsp:position-line start))
-          (1+ (lsp:position-character start)))))
+  (cons (code-insight-mcp--uri-to-path (code-insight-mcp--get item "uri"))
+        (code-insight-mcp--range-start
+         (or range (code-insight-mcp--get item "selectionRange")))))
 
 (defun code-insight-mcp--item-label (item)
   "Return \"KIND NAME\" of call hierarchy ITEM, with its detail if any."
-  (let ((detail (lsp:call-hierarchy-item-detail? item)))
+  (let ((detail (code-insight-mcp--get item "detail")))
     (format "%s %s%s"
-            (alist-get (lsp:call-hierarchy-item-kind item) lsp-symbol-kinds
-                       "Symbol")
-            (lsp:call-hierarchy-item-name item)
-            (if (and detail (not (string-empty-p detail)))
+            (code-insight-mcp--symbol-kind (code-insight-mcp--get item "kind"))
+            (code-insight-mcp--get item "name")
+            ;; clangd gives the name again as the detail
+            (if (and (stringp detail) (not (string-empty-p detail))
+                     (not (equal detail (code-insight-mcp--get item "name"))))
                 (format " (%s)" detail)
               ""))))
 
@@ -496,7 +567,7 @@ LINE and COLUMN count from 1.  RANGE defaults to ITEM's selection range."
 Each is \"FILE:LINE:COLUMN: TEXT [from CALLER]\"."
   (mapcan
    (lambda (call)
-     (let ((from (lsp:call-hierarchy-incoming-call-from call)))
+     (let ((from (code-insight-mcp--get call "from")))
        (mapcar (lambda (range)
                  (pcase-let ((`(,file ,line ,column)
                               (code-insight-mcp--item-position from range)))
@@ -505,8 +576,8 @@ Each is \"FILE:LINE:COLUMN: TEXT [from CALLER]\"."
                                (code-insight-mcp--line-text file line)
                              "")
                            (code-insight-mcp--item-label from))))
-               (code-insight-mcp--location-list
-                (lsp:call-hierarchy-incoming-call-from-ranges call)))))
+               (code-insight-mcp--list
+                (code-insight-mcp--get call "fromRanges")))))
    calls))
 
 (defun code-insight-mcp--outgoing-lines (calls)
@@ -515,16 +586,16 @@ Each is \"FILE:LINE:COLUMN: CALLEE (called on lines ...)\", the
 lines being those of the calls in the caller's file."
   (mapcar
    (lambda (call)
-     (let ((to (lsp:call-hierarchy-outgoing-call-to call)))
+     (let ((to (code-insight-mcp--get call "to")))
        (pcase-let ((`(,file ,line ,column)
                     (code-insight-mcp--item-position to nil)))
          (format "%s:%d:%d: %s (called on line %s)" file line column
                  (code-insight-mcp--item-label to)
                  (mapconcat (lambda (range)
                               (number-to-string
-                               (1+ (lsp:position-line (lsp:range-start range)))))
-                            (code-insight-mcp--location-list
-                             (lsp:call-hierarchy-outgoing-call-from-ranges call))
+                               (car (code-insight-mcp--range-start range))))
+                            (code-insight-mcp--list
+                             (code-insight-mcp--get call "fromRanges"))
                             ", ")))))
    calls))
 
@@ -540,15 +611,17 @@ calls.  The position is found as in `code-insight-mcp-lsp-hover'."
     (pcase-let* ((`(,position . ,response)
                   (code-insight-mcp--lsp-request-at
                    "textDocument/prepareCallHierarchy" line symbol column))
-                 (item (car (code-insight-mcp--location-list response))))
+                 (item (car (code-insight-mcp--list response))))
       (if (not item)
           (format "%s\nNo function here to show calls of" position)
         (let* ((incoming (equal direction "incoming"))
-               (calls (code-insight-mcp--location-list
-                       (lsp-request (if incoming
-                                        "callHierarchy/incomingCalls"
-                                      "callHierarchy/outgoingCalls")
-                                    (list :item item))))
+               (calls (code-insight-mcp--list
+                       (code-insight-mcp--request
+                        (if incoming
+                            "callHierarchy/incomingCalls"
+                          "callHierarchy/outgoingCalls")
+                        (list :item item))))
+               (code-insight-mcp--file-lines (make-hash-table :test #'equal))
                ;; jdtls repeats a call once per call site
                (lines (delete-dups
                        (if incoming
@@ -571,13 +644,12 @@ calls.  The position is found as in `code-insight-mcp-lsp-hover'."
 SYMBOL is a SymbolInformation."
   (pcase-let ((`(,file ,line ,column)
                (code-insight-mcp--location-position
-                (lsp:symbol-information-location symbol)))
-              (container (lsp:symbol-information-container-name? symbol)))
+                (code-insight-mcp--get symbol "location")))
+              (container (code-insight-mcp--get symbol "containerName")))
     (format "%s:%d:%d: %s %s%s" file line column
-            (alist-get (lsp:symbol-information-kind symbol) lsp-symbol-kinds
-                       "Symbol")
-            (lsp:symbol-information-name symbol)
-            (if (and container (not (string-empty-p container)))
+            (code-insight-mcp--symbol-kind (code-insight-mcp--get symbol "kind"))
+            (code-insight-mcp--get symbol "name")
+            (if (and (stringp container) (not (string-empty-p container)))
                 (format " (in %s)" container)
               ""))))
 
@@ -586,8 +658,9 @@ SYMBOL is a SymbolInformation."
 FILE-PATH only picks the language server to ask."
   (with-current-buffer (code-insight-mcp--file-buffer file-path)
     (code-insight-mcp--ensure-lsp "workspace/symbol")
-    (let* ((symbols (code-insight-mcp--location-list
-                     (lsp-request "workspace/symbol" (list :query query))))
+    (let* ((symbols (code-insight-mcp--list
+                     (code-insight-mcp--request "workspace/symbol"
+                                                (list :query query))))
            (shown (seq-take symbols code-insight-mcp-max-locations)))
       (concat (format "%d symbols matching %S" (length symbols) query)
               (mapconcat (lambda (symbol)
@@ -604,16 +677,50 @@ FILE-PATH only picks the language server to ask."
 Each value is the `buffer-chars-modified-tick' of the file's buffer
 when the language server last published diagnostics for it.")
 
-(defun code-insight-mcp--note-diagnostics (_workspace params)
-  "Record which contents the diagnostics in PARAMS are for.
-Runs after `lsp--on-diagnostics', the handler of every
+(defvar code-insight-mcp--eglot-diagnostics (make-hash-table :test #'equal)
+  "Hash table from file names to the diagnostics Eglot last received.
+Eglot hands diagnostics to Flymake, which keeps them in its own form,
+so the server's are kept here as they came.")
+
+(defvar code-insight-mcp--versioned-servers
+  (make-hash-table :test #'eq :weakness 'key)
+  "Language servers seen giving the document version with diagnostics.")
+
+(defun code-insight-mcp--note-diagnostics-for (server file version)
+  "Record that SERVER just sent diagnostics of VERSION for FILE.
+They are taken to be for the contents FILE's buffer has now.  Servers
+that give versions also send diagnostics without one, emptying them
+when a file is closed, as Eglot does when a buffer is reverted; those
+are ignored.  Return the file name of FILE's buffer if recorded."
+  (if version
+      (puthash server t code-insight-mcp--versioned-servers)
+    (when (gethash server code-insight-mcp--versioned-servers)
+      (setq file nil)))
+  (when-let* ((buffer (and file (find-buffer-visiting file))))
+    (puthash (buffer-file-name buffer)
+             (buffer-chars-modified-tick buffer)
+             code-insight-mcp--diagnostics-ticks)
+    (buffer-file-name buffer)))
+
+(defun code-insight-mcp--note-lsp-diagnostics (workspace params)
+  "Record which contents the diagnostics in PARAMS from WORKSPACE are for.
+Runs after `lsp--on-diagnostics', lsp-mode's handler of every
 textDocument/publishDiagnostics notification."
-  (let* ((file (lsp--uri-to-path (lsp:publish-diagnostics-params-uri params)))
-         (buffer (find-buffer-visiting file)))
-    (when buffer
-      (puthash (buffer-file-name buffer)
-               (buffer-chars-modified-tick buffer)
-               code-insight-mcp--diagnostics-ticks))))
+  (code-insight-mcp--note-diagnostics-for
+   workspace
+   (lsp--uri-to-path (code-insight-mcp--get params "uri"))
+   (code-insight-mcp--get params "version")))
+
+(defun code-insight-mcp--note-eglot-diagnostics (server method &rest params)
+  "Keep the diagnostics of an Eglot notification METHOD with PARAMS.
+SERVER sent it.  Runs after `eglot-handle-notification'."
+  (when (eq method 'textDocument/publishDiagnostics)
+    (when-let* ((file (code-insight-mcp--note-diagnostics-for
+                       server
+                       (eglot-uri-to-path (plist-get params :uri))
+                       (plist-get params :version))))
+      (puthash file (code-insight-mcp--list (plist-get params :diagnostics))
+               code-insight-mcp--eglot-diagnostics))))
 
 (defun code-insight-mcp--diagnostics-fresh-p ()
   "Return non-nil if the current buffer's diagnostics are for its contents."
@@ -631,11 +738,17 @@ Servers check a file again only when it changes, so when the buffer
 is unmodified, tell the server it was saved, which may get it checked.
 Return `fresh', `unseen' when the file was never seen checked and is
 unchanged, or `timeout'."
-  (let ((unseen (and (not (gethash buffer-file-name
+  (let ((eglot (eq (code-insight-mcp--client) 'eglot))
+        (unseen (and (not (gethash buffer-file-name
                                    code-insight-mcp--diagnostics-ticks))
                      (not (buffer-modified-p)))))
+    ;; Eglot sends changes when Emacs is idle; send them now
+    (when eglot
+      (eglot--signal-textDocument/didChange))
     (unless (or (code-insight-mcp--diagnostics-fresh-p) (buffer-modified-p))
-      (lsp--text-document-did-save))
+      (if eglot
+          (eglot--signal-textDocument/didSave)
+        (lsp--text-document-did-save)))
     (let ((deadline (+ (float-time)
                        (if unseen
                            (min code-insight-mcp--unseen-wait
@@ -648,6 +761,13 @@ unchanged, or `timeout'."
           (unseen 'unseen)
           (t 'timeout))))
 
+(defun code-insight-mcp--buffer-diagnostics ()
+  "Return the diagnostics last received for the current buffer's file."
+  (code-insight-mcp--list
+   (if (eq (code-insight-mcp--client) 'eglot)
+       (gethash buffer-file-name code-insight-mcp--eglot-diagnostics)
+     (gethash (lsp--fix-path-casing buffer-file-name) (lsp-diagnostics t)))))
+
 (defconst code-insight-mcp--severities
   '((1 . "error") (2 . "warning") (3 . "info") (4 . "hint"))
   "LSP diagnostic severities and their names.")
@@ -655,25 +775,24 @@ unchanged, or `timeout'."
 (defun code-insight-mcp--format-diagnostic (file diagnostic)
   "Return DIAGNOSTIC of FILE as \"FILE:LINE:COLUMN: SEVERITY: MESSAGE\".
 The source and code of DIAGNOSTIC follow in brackets when known."
-  (let* ((start (lsp:range-start (lsp:diagnostic-range diagnostic)))
-         (source (lsp:diagnostic-source? diagnostic))
-         (code (lsp:diagnostic-code? diagnostic))
-         (tag (string-join (delq nil (list source
+  (let* ((source (code-insight-mcp--get diagnostic "source"))
+         (code (code-insight-mcp--get diagnostic "code"))
+         (tag (string-join (delq nil (list (and (stringp source) source)
                                            (and code (format "%s" code))))
                            " ")))
-    (format "%s:%d:%d: %s: %s%s"
-            file
-            (1+ (lsp:position-line start))
-            (1+ (lsp:position-character start))
-            (alist-get (lsp:diagnostic-severity? diagnostic)
-                       code-insight-mcp--severities "unknown")
-            (string-trim (lsp:diagnostic-message diagnostic))
-            (if (string-empty-p tag) "" (format " [%s]" tag)))))
+    (pcase-let ((`(,line ,column) (code-insight-mcp--range-start
+                                   (code-insight-mcp--get diagnostic "range"))))
+      (format "%s:%d:%d: %s: %s%s" file line column
+              (alist-get (code-insight-mcp--get diagnostic "severity")
+                         code-insight-mcp--severities "unknown")
+              (string-trim (code-insight-mcp--get diagnostic "message"))
+              (if (string-empty-p tag) "" (format " [%s]" tag))))))
 
 (defun code-insight-mcp--diagnostic-key (diagnostic)
   "Return a sort key for DIAGNOSTIC: its line, then its column."
-  (let ((start (lsp:range-start (lsp:diagnostic-range diagnostic))))
-    (+ (* 100000 (lsp:position-line start)) (lsp:position-character start))))
+  (pcase-let ((`(,line ,column) (code-insight-mcp--range-start
+                                 (code-insight-mcp--get diagnostic "range"))))
+    (+ (* 100000 line) column)))
 
 (defun code-insight-mcp-lsp-diagnostics (file-path)
   "Return the errors and warnings the language server reports for FILE-PATH.
@@ -683,8 +802,7 @@ new check, at most `code-insight-mcp-diagnostics-timeout' seconds."
     (code-insight-mcp--ensure-lsp)
     (let* ((state (code-insight-mcp--wait-for-diagnostics))
            (diagnostics (sort (copy-sequence
-                               (gethash (lsp--fix-path-casing buffer-file-name)
-                                        (lsp-diagnostics t)))
+                               (code-insight-mcp--buffer-diagnostics))
                               (lambda (a b)
                                 (< (code-insight-mcp--diagnostic-key a)
                                    (code-insight-mcp--diagnostic-key b))))))
@@ -797,7 +915,9 @@ description changed is not served twice."
   (code-insight-mcp--setup-lsp-tools)
   (dolist (f code-insight-mcp--tool-functions)
     (advice-add f :around #'code-insight-mcp--around-tool))
-  (advice-add 'lsp--on-diagnostics :after #'code-insight-mcp--note-diagnostics)
+  (advice-add 'lsp--on-diagnostics :after #'code-insight-mcp--note-lsp-diagnostics)
+  (advice-add 'eglot-handle-notification :after
+              #'code-insight-mcp--note-eglot-diagnostics)
   (unless (claude-code-ide-mcp-server-ensure-server)
     (error "Could not start the MCP server on port %d" code-insight-mcp-port))
   (claude-code-ide-mcp-server-register-session
@@ -810,7 +930,9 @@ description changed is not served twice."
   (claude-code-ide-mcp-server-session-ended code-insight-mcp-session-id)
   (dolist (f code-insight-mcp--tool-functions)
     (advice-remove f #'code-insight-mcp--around-tool))
-  (advice-remove 'lsp--on-diagnostics #'code-insight-mcp--note-diagnostics))
+  (advice-remove 'lsp--on-diagnostics #'code-insight-mcp--note-lsp-diagnostics)
+  (advice-remove 'eglot-handle-notification
+                 #'code-insight-mcp--note-eglot-diagnostics))
 
 ;;;###autoload
 (define-minor-mode code-insight-mcp-mode

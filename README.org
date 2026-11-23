@@ -36,10 +36,10 @@ http://localhost:7777/mcp/emacs
 #+end_example
 
 On top of claude-code-ide's tools it adds its own, which ask the language
-server through [[https://github.com/emacs-lsp/lsp-mode][lsp-mode]].
+server through [[https://github.com/emacs-lsp/lsp-mode][lsp-mode]] or Eglot, whichever manages the file.
 
 #+begin_example
-agent --MCP--> Emacs (this package, lsp-mode) --> language server (jdtls, pyright, ...)
+agent --MCP--> Emacs (this package, lsp-mode or Eglot) --> language server (jdtls, clangd, ...)
 #+end_example
 
 Going through Emacs means the agent uses the same language server you do:
@@ -81,8 +81,9 @@ the agent learns about compile errors without building.
 - Emacs 29.1 or later
 - [[https://github.com/manzaltu/claude-code-ide.el][claude-code-ide]] 0.3.0 or later, for its MCP server and tools.  It is not
   on MELPA, see Install.
-- [[https://github.com/emacs-lsp/lsp-mode][lsp-mode]], for the =lsp_*= tools, with a language server for each
-  language you want them for.  Without it the other tools still work.
+- [[https://github.com/emacs-lsp/lsp-mode][lsp-mode]] or Eglot (built into Emacs), for the =lsp_*= tools, with a
+  language server for each language you want them for.  Without either
+  the other tools still work.
 - Emacs built with tree-sitter and the language's grammar, for
   =treesit_info=
 
@@ -139,15 +140,20 @@ configuration.
 
 ** Languages
 
-The =lsp_*= tools work for a file when lsp-mode works for it in your
-Emacs: a major mode for the language, and its language server installed.
-If it is comfortable to write that language in your Emacs, the tools work
-for it.
+The =lsp_*= tools work for a file when lsp-mode or Eglot works for it in
+your Emacs: a major mode for the language, and its language server
+installed.  If it is comfortable to write that language in your Emacs, the
+tools work for it.
 
-Tools start LSP for a file only in a project lsp-mode already knows, so
-that they never stop at lsp-mode's "Import project root?" question.  Open
-a file of a new project in Emacs once and answer it.  A server that is
-still starting is waited for.
+With Eglot, the tools use the server Eglot runs for the file's project; a
+file the tools open is managed by it as when you visit it.  They do not
+start Eglot themselves, so start it once in the project (=M-x eglot=, or
+=eglot-ensure= in a mode hook).
+
+With lsp-mode, tools start LSP for a file only in a project lsp-mode
+already knows, so that they never stop at lsp-mode's "Import project
+root?" question.  Open a file of a new project in Emacs once and answer
+it.  A server that is still starting is waited for.
 
 ** Getting agents to use the tools
 
@@ -195,12 +201,15 @@ emacs-code-insight lsp_* tools before grep.
   claude-code-ide's tool list, so Claude sessions started from
   claude-code-ide see the same.
 - Any program on the machine can reach the port.  The tools only read.
-- Some of lsp-mode's internals are used (to know when diagnostics arrive
-  and when a server is ready), so a change in lsp-mode may need a change
-  here.
-- Only lsp-mode is supported, not Eglot.
+- Some internals of lsp-mode and Eglot are used (to know when diagnostics
+  arrive, when a server is ready, and to make position parameters), so a
+  change in either may need a change here.
+- Locations inside libraries become readable files only where the client
+  does that: lsp-java does for jdtls's =jdt:= URIs; with Eglot they are
+  given as they come.
 - =xref_references= and =xref_apropos= use whatever xref backend the
-  buffer has: lsp-mode's when it is on, Emacs Lisp's in Emacs Lisp.  In
+  buffer has: lsp-mode's or Eglot's when one is on, Emacs Lisp's in
+  Emacs Lisp.  In
   other buffers xref falls back to a TAGS file (made by etags or ctags),
   and may ask in the minibuffer which one to visit, which would make the
   tool wait for an answer.  This is not prevented yet.
@@ -210,6 +219,7 @@ emacs-code-insight lsp_* tools before grep.
 - [[https://github.com/manzaltu][Yoav Orot]] for claude-code-ide, whose MCP server and tools this package
   serves.
 - The [[https://github.com/emacs-lsp][emacs-lsp]] maintainers for lsp-mode and lsp-java.
+- João Távora and the Emacs maintainers for Eglot.
 
 * License
 

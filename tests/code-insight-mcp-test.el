@@ -142,17 +142,59 @@
       (delete-file clean-file)
       (delete-file edited-file))))
 
-(ert-deftest code-insight-mcp-test-location-list ()
-  "Definition responses become lists of locations."
-  (should-not (code-insight-mcp--location-list nil))
-  (should (equal (code-insight-mcp--location-list '(:uri "a")) '((:uri "a"))))
-  (should (equal (code-insight-mcp--location-list [(:uri "a") (:uri "b")])
+(defun code-insight-mcp-test--hash (plist)
+  "Return PLIST as lsp-mode gives JSON objects: hash tables, string keys.
+Nested plists are converted too, and vectors of them."
+  (let ((table (make-hash-table :test #'equal)))
+    (while plist
+      (puthash (substring (symbol-name (car plist)) 1)
+               (code-insight-mcp-test--convert (cadr plist))
+               table)
+      (setq plist (cddr plist)))
+    table))
+
+(defun code-insight-mcp-test--convert (value)
+  "Convert plists in VALUE with `code-insight-mcp-test--hash'."
+  (cond ((and (consp value) (keywordp (car value)))
+         (code-insight-mcp-test--hash value))
+        ((vectorp value) (vconcat (mapcar #'code-insight-mcp-test--convert value)))
+        (t value)))
+
+(defmacro code-insight-mcp-test--both-forms (var plist &rest body)
+  "Run BODY with VAR bound to PLIST, then to it as lsp-mode's hash table.
+Eglot gives JSON objects as plists, lsp-mode as hash tables."
+  (declare (indent 2))
+  `(dolist (,var (list ,plist (code-insight-mcp-test--hash ,plist)))
+     ,@body))
+
+(ert-deftest code-insight-mcp-test-get ()
+  "JSON properties are read from plists and hash tables alike."
+  (code-insight-mcp-test--both-forms object
+      '(:range (:start (:line 2 :character 13)) :name "Widget")
+    (should (equal (code-insight-mcp--get object "name") "Widget"))
+    (should (= (code-insight-mcp--get object "range" "start" "line") 2))
+    (should-not (code-insight-mcp--get object "missing"))
+    (should-not (code-insight-mcp--get object "missing" "deeper"))))
+
+(ert-deftest code-insight-mcp-test-list ()
+  "JSON arrays become lists, whatever form the client gives them in."
+  (should-not (code-insight-mcp--list nil))
+  (should (equal (code-insight-mcp--list '(:uri "a")) '((:uri "a"))))
+  (should (equal (code-insight-mcp--list [(:uri "a") (:uri "b")])
                  '((:uri "a") (:uri "b"))))
-  ;; Without `lsp-use-plists', arrays are lists of hash tables
+  ;; Without `lsp-use-plists', lsp-mode gives lists of hash tables
   (let ((a (make-hash-table :test #'equal))
         (b (make-hash-table :test #'equal)))
-    (should (equal (code-insight-mcp--location-list (list a b)) (list a b)))
-    (should (equal (code-insight-mcp--location-list a) (list a)))))
+    (should (equal (code-insight-mcp--list (list a b)) (list a b)))
+    (should (equal (code-insight-mcp--list a) (list a)))))
+
+(ert-deftest code-insight-mcp-test-hover-text-objects ()
+  "MarkupContent and MarkedString are read in either form."
+  (code-insight-mcp-test--both-forms markup '(:kind "markdown" :value "Doc.")
+    (should (equal (code-insight-mcp--hover-text markup) "Doc.")))
+  (code-insight-mcp-test--both-forms marked '(:language "java" :value "int f()")
+    (should (equal (code-insight-mcp--hover-text marked)
+                   "```java\nint f()\n```"))))
 
 (ert-deftest code-insight-mcp-test-line-text ()
   "A line is read from the file, trimmed."
@@ -170,36 +212,70 @@
 
 (ert-deftest code-insight-mcp-test-format-diagnostic ()
   "A diagnostic is one line with its position, severity and source."
-  (require 'lsp-protocol)
-  (let ((diagnostic (lsp-make-diagnostic
-                     :range (lsp-make-range
-                             :start (lsp-make-position :line 5 :character 15)
-                             :end (lsp-make-position :line 5 :character 17))
-                     :severity 1
-                     :message "Type mismatch\n"
-                     :source "Java"
-                     :code "16777233")))
+  (code-insight-mcp-test--both-forms diagnostic
+      '(:range (:start (:line 5 :character 15) :end (:line 5 :character 17))
+        :severity 1 :message "Type mismatch\n" :source "Java" :code "16777233")
     (should (equal (code-insight-mcp--format-diagnostic "/a/B.java" diagnostic)
                    "/a/B.java:6:16: error: Type mismatch [Java 16777233]"))))
 
 (ert-deftest code-insight-mcp-test-format-symbol ()
   "A symbol is one line with its position, kind, name and container."
-  (require 'lsp-mode)
-  (let ((range (lsp-make-range
-                :start (lsp-make-position :line 2 :character 13)
-                :end (lsp-make-position :line 2 :character 19))))
-    (should (equal (code-insight-mcp--format-symbol
-                    (lsp-make-symbol-information
-                     :name "Widget" :kind 5 :containerName "com.example"
-                     :location (lsp-make-location :uri "file:///a/Widget.java"
-                                                  :range range)))
-                   "/a/Widget.java:3:14: Class Widget (in com.example)"))
-    (should (equal (code-insight-mcp--format-symbol
-                    (lsp-make-symbol-information
-                     :name "main" :kind 6 :containerName ""
-                     :location (lsp-make-location :uri "file:///a/Main.java"
-                                                  :range range)))
-                   "/a/Main.java:3:14: Method main"))))
+  (cl-letf (((symbol-function 'code-insight-mcp--uri-to-path)
+             (lambda (uri) (string-remove-prefix "file://" uri))))
+    (code-insight-mcp-test--both-forms symbol
+        '(:name "Widget" :kind 5 :containerName "com.example"
+          :location (:uri "file:///a/Widget.java"
+                     :range (:start (:line 2 :character 13)
+                             :end (:line 2 :character 19))))
+      (should (equal (code-insight-mcp--format-symbol symbol)
+                     "/a/Widget.java:3:14: Class Widget (in com.example)")))
+    (code-insight-mcp-test--both-forms symbol
+        '(:name "main" :kind 6 :containerName ""
+          :location (:uri "file:///a/Main.java"
+                     :range (:start (:line 2 :character 13)
+                             :end (:line 2 :character 19))))
+      (should (equal (code-insight-mcp--format-symbol symbol)
+                     "/a/Main.java:3:14: Method main")))))
+
+(ert-deftest code-insight-mcp-test-location-position ()
+  "Locations and location links give the file and start of their range."
+  (cl-letf (((symbol-function 'code-insight-mcp--uri-to-path)
+             (lambda (uri) (string-remove-prefix "file://" uri))))
+    (code-insight-mcp-test--both-forms location
+        '(:uri "file:///a/Widget.java"
+          :range (:start (:line 2 :character 13) :end (:line 2 :character 19)))
+      (should (equal (code-insight-mcp--location-position location)
+                     '("/a/Widget.java" 3 14))))
+    (code-insight-mcp-test--both-forms link
+        '(:targetUri "file:///a/Widget.java"
+          :targetRange (:start (:line 0 :character 0) :end (:line 9 :character 0))
+          :targetSelectionRange (:start (:line 2 :character 13)
+                                 :end (:line 2 :character 19)))
+      (should (equal (code-insight-mcp--location-position link)
+                     '("/a/Widget.java" 3 14))))))
+
+(ert-deftest code-insight-mcp-test-note-diagnostics-versions ()
+  "Once a server gives versions, its diagnostics without one are ignored."
+  (let ((code-insight-mcp--diagnostics-ticks (make-hash-table :test #'equal))
+        (code-insight-mcp--versioned-servers (make-hash-table :test #'eq))
+        (file (make-temp-file "code-insight-mcp" nil ".c" "int x;\n"))
+        (versioned (list 'versioned))
+        (plain (list 'plain)))
+    (unwind-protect
+        (with-current-buffer (find-file-noselect file)
+          ;; A server that never gives versions is always believed
+          (should (code-insight-mcp--note-diagnostics-for plain file nil))
+          (should (code-insight-mcp--diagnostics-fresh-p))
+          (insert "y")
+          (should (code-insight-mcp--note-diagnostics-for versioned file 0))
+          (should (code-insight-mcp--diagnostics-fresh-p))
+          ;; Emptied on close after a revert: not for the new contents
+          (insert "z")
+          (should-not (code-insight-mcp--note-diagnostics-for versioned file nil))
+          (should-not (code-insight-mcp--diagnostics-fresh-p))
+          (set-buffer-modified-p nil)
+          (kill-buffer))
+      (delete-file file))))
 
 (ert-deftest code-insight-mcp-test-diagnostics-fresh-p ()
   "Diagnostics are fresh while the buffer is as it was when they came."
